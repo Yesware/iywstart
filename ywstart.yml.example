@@ -1,0 +1,46 @@
+# Yaml configuration for "standard" nodes you might want to combine.
+
+##### Single Apps #####
+# This section contains setup for a single specific app. This might include
+# bower/npm/bundle, workers, rails, etc.
+example-app: &example-app
+  Example:
+    setup:
+      - npm install
+      - bundle exec rake db:create db:migrate
+    setup-test:
+      - npm install
+      - bundle exec rake db:drop db:create db:migrate
+    commands:
+      - rails s
+      - foreman start worker
+
+example-app2: &example-app2
+  example2:
+    commands:
+      - rails s
+
+##### Multiple Apps #####
+# This section contains setup for a desired functional area which typically includes
+# several apps. These will call other nodes for setup, or override setup for other nodes,
+# and include additional setup for a single app that will mostly ever run in the context
+# of this functional area. For example: imap-server and imap-monitor will typically run
+# together.
+
+# Base setup for the minimal useful runtime
+default: &default
+  <<: *example-app
+  <<: *example-app2
+
+complex: &complex
+  <<: *example-app2
+
+  example-app3:
+    setup:
+      - bundle exec rake db:create db:migrate
+    setup-test:
+      - bundle exec rake db:drop db:create db:migrate
+    commands:
+      - rails s
+      - foreman start sidekiq_all_dev
+      

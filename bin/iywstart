@@ -1,0 +1,595 @@
+#! /usr/bin/env ruby
+
+# Script to start Yesware services. Once running, this will accept a list of
+# commands to control runtime behavior. To see the list of commands, type "?"
+# and enter.
+#
+# Use the --replace option to pass in runtime values and secrets, e.g:
+#   iywstart -n outlook -r SENDGRID_USERNAME=user -r SENDGRID_PASSWORD=seekret
+#
+# TODO:
+# - interactive command p to run arbitrary process (outside of a repo, think
+#   pagekite).
+
+require 'fileutils'
+require 'pty'
+require 'yaml'
+require 'timeout'
+require 'optparse'
+require 'ostruct'
+
+require_relative '../lib/repo_run_config'
+require_relative '../lib/command'
+require_relative '../lib/multiplexer'
+require_relative '../lib/options'
+
+# Which repo to use for checkouts
+checkout_dir = if ENV['YWSTART_REPO_DIR']
+  ENV['YWSTART_REPO_DIR']
+else
+  puts 'YWSTART_REPO_DIR is not set.'
+  puts 'Use current directory?'
+
+  if $stdin.gets.strip =~ /[yY]/
+    '.'
+  else
+    exit 1
+  end
+end
+
+
+begin
+  require 'smart_colored'
+  require 'smart_colored/extend'
+rescue LoadError
+  # No smart_colored gem, tell the user, then monkey patch String.
+  puts "Unable to load smart_colored gem, if you install it, you'll get prettier output"
+  class String
+    def green ; self ; end
+    def red ; self ; end
+    def bold ; self ; end
+  end
+end
+
+$debug = false
+$multiplexer_sleep_time = 0.5
+
+# Struct for capturing forked process details.
+YwProc = Struct.new(:stdin, :stdout, :pid)
+
+def debug(msg = '')
+  puts "DEBUG: #{msg}" if ENV['DEBUG'] || $debug
+end
+
+def info(msg = '')
+  puts msg
+end
+
+def blank_line
+  puts
+end
+
+# Load in the yml configuration file and make each repo node look the same. The
+# structure of the file supports either a list of commands or a sub-hash of
+# setup commands and commands. In the former case, we want to push the list
+# of commands under a "commands" node.
+def load_yaml(file)
+  YAML.load_file(file).tap do |config|
+    # Update the yaml so every node has a setup and a commands even if they
+    # have the short-cut form of just a list of commands to run.
+    config.each do |node, repo_hash|
+      repo_hash.each do |repo, repo_config|
+        if repo_config.is_a? Array
+          repo_hash[repo] = {
+            'commands' => repo_config
+          }
+        end
+      end
+    end
+  end
+end
+
+# Helper methods usable in multiple classes
+module Helpers
+  # Is this repo a ruby one?
+  def self.ruby_repo?(repo)
+    File.file?("#{repo}/.ruby-version") || File.file?("#{repo}/Gemfile")
+  end
+end
+
+# Build up the run configuration by merging all relevant nodes out of the yml
+# configuration file.
+# @param config [Hash] Loaded up raw config (loaded via yaml)
+# @param nodes [Array] List of nodes to merge together to form the run
+#   configuration.
+# @param run_list [Array<RepoRunConfig>] The current list of run configs (default [])
+# @param flags [Hash] Additional option flags
+# @option flags test [Boolean] Are we in test mode? (default false)
+# @option flags smart_update [Boolean] Should we update and setup smartly? (default false)
+# @param except [Array<String>] A list of repos to skip
+# @param replacements [Hash] Placeholders to be replaced with specified values
+# @return [Hash] Hash of the final repo to run config
+def build_run_config(config, nodes = ['default'], run_list = [], flags, except, replacements)
+  nodes.each do |node|
+    if config[node]
+      config[node].each do |repo, repo_config|
+        next if except.include? repo
+
+        run_list << RepoRunConfig.new(repo,
+                                      flags,
+                                      replacements,
+                                      repo_config['setup'],
+                                      repo_config['setup-test'],
+                                      repo_config['commands'])
+      end
+    else
+      puts "Sorry, I don't recognize node #{node}"
+    end
+  end
+
+
+  # Now flatten that down so we have one config per repo and apply some
+  # numbering to the commands.
+  run_list = run_list.group_by(&:repo).map do |repo, configs|
+    configs.first.tap do |config|
+      configs[1..-1].each do |other_config|
+        config.merge!(other_config)
+      end
+    end
+  end.tap do |run_list|
+    number = 1
+    run_list.each do |config|
+      number = config.number_commands(number)
+    end
+  end
+end
+
+# Is the process alive?
+# @param pid [Integer] Process to determine whether or not it's still alive.
+# @return [Boolean] Whether or not the process is alive.
+def is_alive?(pid)
+  Process.getpgid(pid)
+  true
+rescue Errno::ESRCH
+  false
+end
+
+# Return a list of pids for all processes in this tree, including the specified
+# pid.
+# @param pid [Integer] Process id to determine all children processes for
+# @return [Array] Array of all processes in the tree (including the parent).
+def tree_pids(pid)
+  descendants = Hash.new { |ht, k| ht[k] = [k] }
+  Hash[*`ps -eo pid,ppid`.scan(/\d+/).map do |x|
+         x.to_i
+       end].each do |pid,ppid|
+    descendants[ppid] << descendants[pid]
+  end
+  descendants[pid].flatten
+end
+
+# Wait for all pids in the list of processes to terminate.
+# @param pids [Array] List of process ids to wait for
+# @param timeout [Integer] How many seconds to wait
+# @return [Boolean] whether or not all pids were terminated or not.
+def wait_for_all_pids_to_terminate(pids, timeout = 5)
+  running_pids = pids.dup
+  begin
+    Timeout.timeout(timeout) do
+      while running_pids.any? do
+        sleep(1)
+        running_pids.select! do |pid|
+          is_alive?(pid)
+        end
+      end
+    end
+    debug("All pids are done executing.")
+    true
+  rescue Timeout::Error => ex
+    debug("Ran out of time waiting for pids to die.")
+    false
+  end
+end
+
+# Send a signal to a process, catching any exceptions.
+# @param pid [String, Integer] Pid to send the signal to
+# @param signal [String] Type of signal to send to the process
+def send_signal(pid, signal = 'TERM')
+  Process.kill(signal, pid)
+rescue => e
+  debug("Error sending signal #{signal} to #{pid}")
+  debug(e.inspect)
+end
+
+# Terminate an entire tree of pid's. This is done firstly as taking a list of
+# pid's and turning it into a list of all pids within each pid's process tree.
+# Each of those processes is sent a sigterm and given 5s to quit. If they do
+# not, then we send a sigkill signal to them.
+# @param pids [Array] Array of (parent) pids to terminate.
+def terminate_processes(pids)
+  all_pids = pids.map { |pid| tree_pids(pid) }.flatten
+  debug("Beginning termination of #{all_pids.inspect}")
+  all_pids.each do |pid|
+    debug("  sending TERM to #{pid}")
+    # SIGTERM seems to be the only signal that gets through the parent bash
+    # process that runs the script. Tried INT, but it doesn't do anything.
+    send_signal(pid, 'TERM')
+  end
+
+  if wait_for_all_pids_to_terminate(all_pids, 5)
+    debug("No pids are alive, we're all done")
+  else
+    debug("Pids are still running, go ahead and kill them.")
+    all_pids.select { |pid| is_alive?(pid) }.each do |pid|
+      info("  killing pid #{pid}")
+      send_signal(pid, 'KILL')
+    end
+    debug("Done killing still-alive children pids.")
+  end
+end
+
+# Execute command-line via Kernel#system and exit if it fails to run or returns a non-zero exit
+# code.
+def system_with_exit(cmdline)
+  result = system cmdline
+  unless result
+    exit_code = (result.nil? && 1) || $?.exitstatus
+    if result.nil?
+      info "ERROR: Failed to execute #{cmdline.inspect}"
+    else
+      info "ERROR: command #{cmdline.inspect} exited with status #{exit_code}"
+    end
+    Process::Status
+    exit exit_code
+  end
+end
+
+def parallelize_setup_commands(run_config)
+  run_config.each do |rc|
+    fork do
+      rc.run_setup_commands
+    end
+  end
+
+  if first_failed_command = Process.waitall.find { |process_status| process_status[1] != 0 }
+    exit first_failed_command[1].exitstatus
+  end
+end
+
+# Signal to shut down all running processes and exit yw-start.
+# @param run_config [Array<RepoRunConfig>] The current run_config.
+def shutdown!(run_config)
+  run_config.each do |config|
+    config.commands.each(&:stop)
+  end
+  exit
+end
+
+# Starts up a thread that watches for the .shutdown file to appear. If it sees
+# it, it will initiate the shutdown process, terminating ywstart.
+# @param checkout_dir [String] Directory where we performed the checkout.
+# @param run_config [Hash] Run configuration
+def start_shutdown_watcher(checkout_dir, run_config)
+  Thread.new do
+    while true do
+      FileUtils.cd(checkout_dir) do
+        # The ".shutdown" file will be touched in CI after all examples
+        # have run in order to stop all the started processes and exit ywstart.
+        if File.exists?('.shutdown')
+          debug("Saw the .shutdown file, shutting down")
+          shutdown!(run_config)
+          break
+        else
+          sleep 0.5
+        end
+      end
+    end
+  end
+end
+
+# Dump a list of the running commands in each of the repositories.
+def dump_process_list(run_config)
+  puts "Process listing"
+  run_config.each do |config|
+    puts "Repo: #{config.repo}".bold.green
+    puts "PID\t\tProcess number\tCommand"
+    config.commands.each do |command|
+      print "[#{command.process.pid}]\t\t"
+      if command.alive?
+        print "[#{command.number}]".bold.green
+      else
+        print "[#{command.number}]".bold.red
+      end
+      puts "\t\t#{command.command}"
+    end
+  end
+  blank_line
+end
+
+def node_hash
+  @node_hash ||= load_yaml(options.yml_file).sort.to_h
+end
+
+def dump_node_list
+  puts "Available nodes:"
+  node_hash.each_with_index do |node, idx|
+    puts "#{idx}\t#{node[0]}"
+  end
+end
+
+# Finds a command or returns nil.
+def find_command(run_config, number)
+  run_config.map do |config|
+    config.commands.find do |command|
+      command.number == number
+    end
+  end.compact.first
+end
+
+# Restarts a command by number.
+def restart_command(run_config, number)
+  command = find_command(run_config, number)
+  if command
+    puts "Restarting repo [#{command.repo}], command #{command.command}".green
+    command.restart
+  else
+    puts "Unable to find command"
+  end
+  blank_line
+end
+
+# Stops a command by number.
+def stop_command(run_config, number)
+  command = find_command(run_config, number)
+  if command
+    puts "Stopping repo [#{command.repo}], command #{command.command}".red
+    command.stop
+  else
+    puts "Unable to find command"
+  end
+  blank_line
+end
+
+# Print out the help menu of interactive commands.
+def print_help
+  puts "Help for ywstart interactive commands".bold.green
+  blank_line
+  puts "  ? - print this menu"
+  blank_line
+  puts "  p - Dump the list of running processes"
+  blank_line
+  puts "  r - Restart a given command in the process list"
+  blank_line
+  puts "  s - Stop a given command in the process list"
+  blank_line
+  puts "  q - Quit ywstart, signalling shutdown to all processes"
+  blank_line
+  puts "  l - Toggle the display of output from the spawned processes"
+  blank_line
+  puts "  a - Add a node"
+  blank_line
+  puts "  d - Remove a node"
+  blank_line
+  puts "  /reg*ex+ - Filter subsequent logs by regex (no need for the //). Enter a blank line to clear"
+  blank_line
+  puts "  i/reg*ex+ - Filter by regex, same as above but case-insensitive"
+  blank_line
+end
+
+def start_node(new_node, run_config)
+  original_run_config = run_config.clone
+  # update run_config, taking the existing array into account so as to
+  # avoid duplicates
+  run_config.replace(
+    build_run_config(
+      node_hash,
+      [new_node],
+      run_config,
+      # all run configs were created with the same `flags` and `replacements` values, so we
+      # can obtain the correct current value from any of them
+      run_config[0].flags,
+      [],
+      run_config[0].replacements
+    )
+  )
+  # kick off commands in repos that didn't exist in the original run_config, and therefore
+  # aren't already running
+  new_run_configs = run_config - original_run_config
+  debug "new_run_configs: #{new_run_configs.inspect}"
+  if new_run_configs.size > 0
+    puts "Starting node #{new_node}..."
+    # TODO re-enable after handling things like failed npm install. Also add the other stuff under "Clone or update"
+    # FileUtils.cd(checkout_dir) do
+    # new_run_configs.each(&:clone_or_update)# if options.git_update
+      # new_run_configs.each(&:bundle_install)
+    # new_run_configs.each(&:setup_for_log_tailing)# if options.setup_for_log_tailing
+      # new_run_configs.each(&:run_setup_commands)
+    # end
+    new_run_configs.each(&:kickoff_commands)
+  end
+end
+
+def dump_running_nodes_list(run_config)
+  puts "Running nodes:"
+
+  run_config.each_with_index do |repo_run_config, idx|
+    puts "#{idx}:\t#{repo_run_config.repo}"
+    repo_run_config.commands.each do |command|
+      puts "\t- #{command.command}"
+    end
+  end
+end
+
+def remove_node(removed_node_number, removed_node, run_config)
+  removed_node.commands.each(&:stop)
+  run_config.delete_at(removed_node_number)
+end
+
+FILTER_REGEX_PREFIX = /(^i?\/)(.*)/
+
+# Start the "REPL" loop. NOTE: This is blocking
+# @param multiplexer [Multiplexer] the thing that multiplexes the logs.
+# @param run_config [Hash] Run configuration
+def start_command_loop(multiplexer, run_config)
+  # Now go into a loop, reading input
+  while true do
+    puts "Awaiting your input"
+    input = STDIN.readline
+    case input.chomp!
+    when "?"
+      print_help
+    when "p"
+      dump_process_list(run_config)
+    when "r"
+      puts "Which item do you want to restart?"
+      restart = STDIN.readline
+      restart_command(run_config, restart.to_i)
+    when "s"
+      puts "Which item do you want to stop?"
+      stop = STDIN.readline
+      stop_command(run_config, stop.to_i)
+    when "q"
+      shutdown!(run_config)
+    when "l"
+      multiplexer.toggle!
+    when "a"
+      dump_node_list
+      puts "Which node do you want to add?"
+      new_node_input = STDIN.readline.chomp
+      unless new_node_input =~ /^\d+$/
+        puts "ERROR: that wasn't a number"
+        next
+      end
+      new_node_number = new_node_input.to_i
+      new_node = node_hash.keys[new_node_number]
+      start_node(new_node, run_config)
+      multiplexer.restart_with(run_config)
+    when "d"
+      dump_running_nodes_list(run_config)
+      puts "Which node do you want to remove?"
+      removed_node_input = STDIN.readline.chomp
+      unless removed_node_input =~ /^\d+$/
+        puts "ERROR: that wasn't a number"
+        next
+      end
+      removed_node_number = removed_node_input.to_i
+      removed_node = run_config[removed_node_number]
+      remove_node(removed_node_number, removed_node, run_config)
+      multiplexer.restart_with(run_config)
+    else
+      if input =~ FILTER_REGEX_PREFIX
+        filter_regex = $2
+        ignore_case = $1[0] == "i"
+
+        if filter_regex.empty?
+          multiplexer.filter_regex = nil
+          puts "Cleared filter regex".bold.green
+        else
+          multiplexer.filter_regex = Regexp.new(filter_regex,  ignore_case)
+          puts "Only showing lines matching /#{filter_regex}/#{ignore_case ? 'i' : ''}".bold.green
+        end
+      else
+        puts "Unrecognized command \"#{input.inspect}\", feel free to add it!"
+      end
+    end
+  end
+end
+
+# ------------------------------------------------------------------------------
+# Start of script
+
+info("Starting iywstart, pid: #{$$}")
+args = ARGV.dup
+
+latest_changes = `git log --pretty=oneline --abbrev-commit | head -3`
+info("\n#{'*' * 20} NEW #{'*' * 20} \n\nDid you know about these latest updates?\n\n#{latest_changes}\n\n#{'*' * 45}")
+
+load_options
+
+# Load the yml file and build the final list of what to run
+config = load_yaml(options.yml_file)
+debug(config.inspect)
+flags = {
+  test: options.test,
+  smart_update: options.smart_update
+}
+run_config = build_run_config(config, options.run_nodes, [], flags, options.except, options.replacements)
+debug "Merged config: #{run_config.inspect}"
+
+def update_tools(options, reinvoke_args)
+  # Update tools. If finding iywstart updated, prompt user to exit and rerun.
+  # get current file path, get its parent directory then get its parent
+  # directory again because the file is in /bin
+  tools_dir = File.expand_path("../..", File.realdirpath(__FILE__))
+  FileUtils.cd(tools_dir) do
+    info "Updating tools..."
+    git_pull_output = `git pull`
+    if $?.exitstatus == 0
+      if git_pull_output =~ /iywstart/
+        puts "iywstart has been updated! Exit and rerun?"
+        if $stdin.gets.strip =~ /[yY]/
+          exec(__FILE__, *reinvoke_args)
+        end
+      end
+    else
+      info "Updating tools failed! Error: #{git_pull_output}"
+      exit $?.exitstatus
+    end
+  end
+end
+
+if !options.no_self_update
+  # update_tools(options, args)  #TODO Fixup for repo move
+end
+
+FileUtils.cd(checkout_dir) do
+  # Remove any existing ".shutdown" file before starting.
+  # In CI this file will be touched to stop ywstart and any processes that it
+  # started.
+  FileUtils.rm_f('.shutdown')
+
+  # Clone or update
+  run_config.each(&:clone_or_update) if options.git_update
+
+  # Bundle install
+  run_config.each(&:bundle_install) if options.bundle_install
+
+  # Log tailing setup
+  run_config.each(&:setup_for_log_tailing) if options.setup_for_log_tailing
+
+  # Run through the setup list.
+  if options.run_setup_commands
+    options.parallelize_setup ? parallelize_setup_commands(run_config) : run_config.each(&:run_setup_commands)
+  end
+end
+
+# Now kick off each command
+FileUtils.cd(checkout_dir) do
+  run_config.each(&:kickoff_commands)
+end
+
+Signal.trap('INT') do
+  debug "Trapped interrupt signal, send sigterm to each pid"
+  shutdown!(run_config)
+end
+
+
+@log_file = if options.log_to_file
+             File.join(checkout_dir, 'ywstart.log')
+           else
+             nil
+           end
+
+multiplexer = Multiplexer.new(run_config, @log_file)
+multiplexer.start
+
+start_shutdown_watcher(checkout_dir, run_config)
+
+if options.non_interactive
+  while true do
+    sleep 1
+  end
+else
+  start_command_loop(multiplexer, run_config)
+end
+

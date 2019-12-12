@@ -64,9 +64,12 @@ class RepoRunConfig
     unless skip_setup
       if Helpers.ruby_repo?(repo)
         info "Running bundle install for #{repo}...".bold.green
-        # install a known, recent version of bundler
-        system_with_exit "rvm in #{repo} do gem install bundler -v 1.15.2 -N"
-        system_with_exit "rvm in #{repo} do bundle _1.15.2_ install"
+        # Install the version of Bundler referenced in the repo's lockfile.
+        # Defaults to 1.15.2 if one can't be found.
+        bundler_version = `grep -A 1 \"BUNDLED WITH\" #{repo}/Gemfile.lock | tail -n 1`.strip
+        bundler_version = bundler_version.empty? ? '1.15.2' : bundler_version
+        system_with_exit "rvm in #{repo} do gem install bundler -v #{bundler_version} -N"
+        system_with_exit "rvm in #{repo} do bundle _#{bundler_version}_ install"
       end
     end
   end
